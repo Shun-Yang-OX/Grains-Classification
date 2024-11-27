@@ -10,9 +10,6 @@ def build_resnet152_for_xray(num_classes, pretrained=True):
     # Load the pretrained ResNet-152 model
     model = models.resnet152(pretrained=pretrained)
     
-    # Modify the first convolution layer to accept single-channel input
-    model.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    
     # Modify the fully connected layer to set the output number of classes to `num_classes`
     num_features = model.fc.in_features
     model.fc = nn.Linear(num_features, num_classes)
@@ -28,7 +25,7 @@ def build_swin_transformer_model(model_name='swin_large_patch4_window12_384_in22
                                  num_classes=2,
                                  img_size=1200,
                                  pretrained=True,
-                                 in_chans=1
+                                 in_chans=3
                                  ):
     """
     Build and return a Swin Transformer model for classification tasks.

@@ -4,6 +4,7 @@ import torch.distributed as dist
 from torch.amp import autocast
 from tqdm import tqdm
 import torch.nn.functional as F
+import utils
 
 def setup_ddp(rank, world_size):
     """
@@ -22,7 +23,7 @@ def cleanup_ddp():
     """Clean up the DDP environment by destroying the process group."""
     dist.destroy_process_group()
 
-def train_and_validate_one_epoch_ddp(model, data_loader_train, data_loader_val, train_sampler, optimizer, scaler, device, epoch, rank, scheduler):
+def train_and_validate_one_epoch_ddp(model, data_loader_train, data_loader_val, train_sampler, optimizer, scaler, device, epoch, rank, scheduler, tb_writer=None):
     """
     Train and validate the model for one epoch using DDP for image classification with ResNet.
     Args:
@@ -42,6 +43,10 @@ def train_and_validate_one_epoch_ddp(model, data_loader_train, data_loader_val, 
     train_sampler.set_epoch(epoch)
     
     total_train_loss = 0.0
+    total_steps_per_epoch = len(data_loader_train)  # 获取每个 epoch 的总步数
+    num_logs_per_epoch = 30  # 您希望每个 epoch 记录的点数
+    log_interval = max(1, total_steps_per_epoch // num_logs_per_epoch)  # 计算日志记录间隔
+    global_step = epoch * total_steps_per_epoch  # 计算当前 epoch 开始时的全局 step 数
 
     # Create tqdm progress bar for the training set
     if rank == 0:
@@ -49,7 +54,7 @@ def train_and_validate_one_epoch_ddp(model, data_loader_train, data_loader_val, 
     else:
         train_progress_bar = data_loader_train  # Other ranks use a normal iterator
 
-    for images, labels in train_progress_bar:
+    for batch_idx, (images, labels) in enumerate(train_progress_bar):
         images, labels = images.to(device), labels.to(device)
 
         optimizer.zero_grad()
@@ -69,6 +74,15 @@ def train_and_validate_one_epoch_ddp(model, data_loader_train, data_loader_val, 
         # Update the description of the tqdm progress bar
         if rank == 0:
             train_progress_bar.set_postfix(loss=loss.item())
+        
+        # update  global_step
+        global_step += 1
+
+        # 仅在主进程上记录
+        if rank == 0 and (batch_idx + 1) % log_interval == 0:
+            # 记录训练损失到 TensorBoard
+            learning_rate = optimizer.param_groups[0]['lr']
+            utils.log_metrics_to_tensorboard(tb_writer, global_step, train_loss=loss.item(), learning_rate=learning_rate, rank=rank)
 
     # Use all_reduce to calculate the total training loss across all GPUs
     total_train_loss_tensor = torch.tensor(total_train_loss, dtype=torch.float32, device=device)
@@ -110,6 +124,11 @@ def train_and_validate_one_epoch_ddp(model, data_loader_train, data_loader_val, 
     total_val_loss_tensor = total_val_loss_tensor / dist.get_world_size()  # Calculate average loss
 
     average_val_loss = total_val_loss_tensor.item() / len(data_loader_val)
+
+    # 在主进程上记录验证损失
+    if rank == 0:
+        utils.log_metrics_to_tensorboard(tb_writer, global_step, validation_loss=average_val_loss, rank=rank)
+
 
     if rank == 0:
         print(f"Rank {rank} | Epoch [{epoch}] Validation Completed | Average Val Loss (all GPUs): {average_val_loss:.4f}")

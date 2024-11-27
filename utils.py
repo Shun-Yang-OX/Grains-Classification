@@ -30,12 +30,15 @@ def log_metrics_to_file(epoch, train_loss, validation_loss, learning_rate, durat
     if rank == 0:
         logging.info(f"Epoch: {epoch}, Train Loss: {train_loss:.4f}, Validation Loss: {validation_loss:.4f}, LR: {learning_rate:.6f}, Duration: {duration:.2f}s")
 
-def log_metrics_to_tensorboard(tb_writer, epoch, train_loss, validation_loss, learning_rate, rank):
-    # Log metrics to TensorBoard if on the main process (rank 0)
+def log_metrics_to_tensorboard(tb_writer, global_step, train_loss=None, validation_loss=None, learning_rate=None, rank=0):
     if rank == 0 and tb_writer is not None:
-        tb_writer.add_scalar('Loss/train', train_loss, epoch)
-        tb_writer.add_scalar('Loss/validation', validation_loss, epoch)
-        tb_writer.add_scalar('Learning Rate', learning_rate, epoch)
+        if train_loss is not None:
+            tb_writer.add_scalar('Loss/train', train_loss, global_step)
+        if validation_loss is not None:
+            tb_writer.add_scalar('Loss/validation', validation_loss, global_step)
+        if learning_rate is not None:
+            tb_writer.add_scalar('Learning Rate', learning_rate, global_step)
+
 
 ######################################################################################################
 

@@ -8,7 +8,7 @@ import seaborn as sns
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 from PIL import Image
-from tqdm import tqdm  # Import tqdm for progress bar
+from tqdm import tqdm  
 
 # Import custom modules
 import Model
@@ -18,10 +18,11 @@ import utils
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
+# Custom loader to convert grayscale to RGB
 def grayscale_loader(path):
     with open(path, 'rb') as f:
         img = Image.open(f)
-        return img.convert('L')  # Convert image to grayscale
+        return img.convert('RGB')  # Convert image to RGB (three-channel)
 
 def main(data_dir, result_folder, model_weights_path, num_classes, batch_size, seed):
     utils.set_seed(seed)
@@ -58,8 +59,10 @@ def main(data_dir, result_folder, model_weights_path, num_classes, batch_size, s
     # Create test dataset and DataLoader with the custom loader
     test_dir = os.path.join(data_dir, 'test')  # Adjust the subdirectory name if different
 
-    test_dataset = datasets.ImageFolder(test_dir, transform=data_transforms, loader=grayscale_loader,
-                                        target_transform=lambda x: 1 - x)
+    test_dataset = datasets.ImageFolder(test_dir, transform=data_transforms, loader=grayscale_loader,target_transform=lambda x: 1 - x)
+    print("Test Dataset Classes:", test_dataset.classes)
+
+    
 
     data_loader_test = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
@@ -111,13 +114,28 @@ def main(data_dir, result_folder, model_weights_path, num_classes, batch_size, s
     # Create confusion matrix and save it as an image
     all_classes = [0, 1]
     conf_matrix = confusion_matrix(y_true, y_pred,labels=all_classes)
+    print("Confusion Matrix:")
+    print(conf_matrix)
     plt.figure(figsize=(8, 6))
-    sns.heatmap(conf_matrix, annot=True, fmt="d", cmap="Blues",cbar=True,
+    ax = sns.heatmap(conf_matrix, annot=False, fmt="d", cmap="Blues",cbar=True,
                 xticklabels=test_dataset.classes,
-                yticklabels=test_dataset.classes)
-    plt.xlabel("Predicted Label")
-    plt.ylabel("True Label")
-    plt.title("Confusion Matrix")
+                yticklabels=test_dataset.classes,
+                annot_kws={"size": 20},
+                linewidths=0.5, linecolor='black',
+                vmin=0, vmax=np.max(conf_matrix))
+    plt.xlabel("Predicted Label", fontsize=18)
+    plt.ylabel("True Label", fontsize=18)
+    plt.title("Confusion Matrix", fontsize=20)
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
+    # 手动添加注释
+    for i in range(conf_matrix.shape[0]):
+        for j in range(conf_matrix.shape[1]):
+            plt.text(j + 0.5, i + 0.5, str(conf_matrix[i, j]), 
+                    horizontalalignment='center', verticalalignment='center', color="black", fontsize=16)
+
+    plt.tight_layout()
+    
     conf_matrix_path = os.path.join(result_folder, "confusion_matrix.png")
     plt.savefig(conf_matrix_path)
 
@@ -145,9 +163,9 @@ def main(data_dir, result_folder, model_weights_path, num_classes, batch_size, s
 
 # Entry point
 if __name__ == "__main__":
-    DATA_DIR = r'/home/shun/Project/Grains-Classification/Data'
+    DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/Classifier_data_2'
     RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result'
-    MODEL_WEIGHTS_PATH = r'/home/shun/Project/Grains-Classification/Result/checkpoints/best_model_epoch_0_val_loss_0.0020.pth'  # Update with your model path
+    MODEL_WEIGHTS_PATH = r'/home/shun/Project/Grains-Classification/Result/checkpoints_ResNet_Newdataset/best_model_epoch_3_val_loss_0.0623.pth'  # Update with your model path
     num_classes = 2
     batch_size = 32
     seed = 10086

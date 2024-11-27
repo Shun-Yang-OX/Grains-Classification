@@ -56,7 +56,7 @@ def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs,
     data_loader_train, data_loader_validation, data_test = dataset.create_data_loaders_ddp(data_dir, batch_size)
 
     # Create the model and move it to the appropriate device
-    model = Model.build_resnet152_for_xray(num_classes=2).to(device)
+    model = Model.build_swin_transformer_model(num_classes=2).to(device)
 
     # Wrap the model with DistributedDataParallel
     model = DDP(model, device_ids=[rank])
@@ -100,7 +100,7 @@ def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs,
 
         # Train and validate for one epoch
         train_loss, val_loss = Engine.train_and_validate_one_epoch_ddp(
-            model, data_loader_train, data_loader_validation, data_loader_train.sampler, optimizer, scaler, device, epoch, rank, scheduler
+            model, data_loader_train, data_loader_validation, data_loader_train.sampler, optimizer, scaler, device, epoch, rank, scheduler, tb_writer
         )
 
         # Get learning rate and epoch duration
@@ -122,7 +122,9 @@ def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs,
 
     # Training completed, cleanup DDP processes
     Engine.cleanup_ddp()
-    tb_writer.close()
+    if rank == 0:
+        tb_writer.close()
+
 
 # ----------------------------------------
 # Main Function
@@ -156,13 +158,13 @@ def main_ddp(world_size, data_dir, Result_folder, batch_size, num_epochs, seed):
 
 if __name__ == "__main__":
 
-    DATA_DIR = r'/home/shun/Project/Grains-Classification/Data'
+    DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/Classifier_data_2'
     RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result'
 
     # Configuration parameters
     world_size = 4  # Number of GPUs to use
-    batch_size = 16
-    num_epochs = 100
+    batch_size = 2
+    num_epochs = 11
     seed = 10086
 
     # Start the distributed training
