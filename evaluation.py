@@ -53,7 +53,7 @@ def main(data_dir, result_folder, model_weights_path, num_classes, batch_size, s
     data_transforms = transforms.Compose([
         transforms.Resize((1200, 1200)),  # Adjust the size if needed
         transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5])  # Adjust mean and std for 1 channel
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225])  # Adjust mean and std for 1 channel
     ])
 
     # Create test dataset and DataLoader with the custom loader
@@ -163,9 +163,9 @@ def main(data_dir, result_folder, model_weights_path, num_classes, batch_size, s
 
 # Entry point
 if __name__ == "__main__":
-    DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/Classifier_data_2'
-    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result'
-    MODEL_WEIGHTS_PATH = r'/home/shun/Project/Grains-Classification/Result/checkpoints_ResNet_Newdataset/best_model_epoch_3_val_loss_0.0623.pth'  # Update with your model path
+    DATA_DIR =  r'/home/shun/Project/Grains-Classification/Dataset/classifier_accuracy_test_final'
+    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result_test/ResNet_unfrozen/global_result'
+    MODEL_WEIGHTS_PATH = r'/home/shun/Project/Grains-Classification/Result_test/ResNet_unfrozen/ResNet_unfrozen_checkpoints/best_model_epoch_12_val_loss_0.0000.pth'  # Update with your model path
     num_classes = 2
     batch_size = 32
     seed = 10086

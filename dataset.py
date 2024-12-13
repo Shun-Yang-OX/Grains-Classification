@@ -121,7 +121,7 @@ class CustomXrayDataset(Dataset):
 
         return image, label
 
-def create_data_loaders_ddp(data_dir, batch_size=32, num_workers=25):
+def create_data_loaders_ddp(data_dir, batch_size=32, num_workers=8):
     # 创建数据集对象
     train_data = CustomXrayDataset(data_dir=os.path.join(data_dir, 'train'),
                                    phase='train')
