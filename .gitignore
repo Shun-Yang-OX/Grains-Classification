@@ -6,3 +6,6 @@
 /Dataset/
 /*.log
 /Result_test/
+/.env
+/Result_test_2025.01/
+/test.py

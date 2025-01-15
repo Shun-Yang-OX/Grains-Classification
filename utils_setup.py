@@ -1,4 +1,3 @@
-from torch.utils.tensorboard import SummaryWriter
 from torch.amp import GradScaler
 import logging
 import random
@@ -6,12 +5,25 @@ import numpy as np
 import torch
 import re
 import os
+from comet_ml import Experiment  # Import Experiment from Comet.ml
+
 
 ## Logger ##
 ######################################################################################################
-def setup_logging(log_dir, rank):
-    # Set up logging if on the main process (rank 0)
+def setup_logging(log_dir, rank, comet_api_key=None, comet_project_name=None, comet_workspace=None):
+    """
+    Set up logging. For the main process (rank=0), configure file logging and Comet.ml experiment.
+
+    Parameters:
+    - log_dir (str): Log directory.
+    - rank (int): Process rank.
+    - comet_api_key (str, optional): API key for Comet.ml. If not provided, will attempt to read from environment variable 'COMET_API_KEY'.
+    - comet_project_name (str, optional): Project name on Comet.ml.
+    - comet_workspace (str, optional): Workspace name on Comet.ml.
+    """
+    experiment = None
     if rank == 0:
+        # Set up file logging
         log_file = os.path.join(log_dir, f'train_rank_{rank}.log')
         os.makedirs(log_dir, exist_ok=True)
         logging.basicConfig(
@@ -20,24 +32,60 @@ def setup_logging(log_dir, rank):
             format='%(asctime)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
         )
-        tb_writer = SummaryWriter(log_dir=log_dir)
-    else:
-        tb_writer = None
-    return tb_writer
+        logging.info("Logging is set up.")
+
+        # Set up Comet.ml experiment
+        experiment = Experiment(
+            api_key=comet_api_key,  # Your Comet.ml API key
+            project_name=comet_project_name,  # Your project name
+            workspace=comet_workspace,  # Your workspace name
+            log_code=True,  # Whether to automatically log code
+            auto_output_logging="simple",  # Auto output logging level
+        )
+        logging.info("Comet.ml experiment is initialized.")
+    return experiment
 
 def log_metrics_to_file(epoch, train_loss, validation_loss, learning_rate, duration, rank):
-    # Log metrics to a file if on the main process (rank 0)
+    """
+    Log training metrics to a log file (main process only).
+
+    Parameters:
+    - epoch (int): Current epoch.
+    - train_loss (float): Training loss.
+    - validation_loss (float): Validation loss.
+    - learning_rate (float): Current learning rate.
+    - duration (float): Duration of this epoch (seconds).
+    - rank (int): Process rank.
+    """
     if rank == 0:
         logging.info(f"Epoch: {epoch}, Train Loss: {train_loss:.4f}, Validation Loss: {validation_loss:.4f}, LR: {learning_rate:.6f}, Duration: {duration:.2f}s")
 
-def log_metrics_to_tensorboard(tb_writer, global_step, train_loss=None, validation_loss=None, learning_rate=None, rank=0):
-    if rank == 0 and tb_writer is not None:
+def log_metrics_to_comet(experiment, global_step, train_loss=None, validation_loss=None, learning_rate=None, duration=None, rank=0):
+    """
+    Log training metrics to Comet.ml (main process only).
+
+    Parameters:
+    - experiment (Experiment): Comet.ml Experiment object.
+    - global_step (int): Global step.
+    - train_loss (float, optional): Training loss.
+    - validation_loss (float, optional): Validation loss.
+    - learning_rate (float, optional): Current learning rate.
+    - duration (float, optional): Duration of this epoch (seconds).
+    - rank (int): Process rank.
+    """
+    if rank == 0 and experiment is not None:
+        metrics = {"global_step": global_step}
         if train_loss is not None:
-            tb_writer.add_scalar('Loss/train', train_loss, global_step)
+            metrics["Loss/train"] = train_loss
         if validation_loss is not None:
-            tb_writer.add_scalar('Loss/validation', validation_loss, global_step)
+            metrics["Loss/validation"] = validation_loss
         if learning_rate is not None:
-            tb_writer.add_scalar('Learning Rate', learning_rate, global_step)
+            metrics["Learning Rate"] = learning_rate
+        if duration is not None:
+            metrics["Duration (s)"] = duration
+
+        experiment.log_metrics(metrics, step=global_step)
+
 
 
 ######################################################################################################
