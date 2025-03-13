@@ -12,7 +12,7 @@ class GrayToRGB:
 
 class BottomCrop:
     """
-    Crop a region of specified size from the bottom of the image, horizontally centered.
+    Crop a region of a specified size from the bottom of the image, horizontally centered.
     """
     def __init__(self, size):
         if isinstance(size, int):
@@ -39,14 +39,13 @@ class CustomXrayDataset(Dataset):
         """
         self.data_dir = data_dir
         self.phase = phase.lower()
-        self.expected_size = expected_size  # Crop size uniformly set to 1056x1056
+        self.expected_size = expected_size  # Uniformly set crop size to 1056x1056
 
-        # Mapping from class names to numerical labels, including "IMC"
+        # Mapping from class names to numerical labels, retaining only three classes
         self.label_map = {
             "equiax": 0,
             "columnar": 1,
-            "background": 2,
-            "IMC": 3
+            "background": 2
         }
 
         self.images = []
@@ -101,42 +100,16 @@ class CustomXrayDataset(Dataset):
 
         # ------------------ Define preprocessing pipelines for different phases ------------------ #
         if self.phase == 'train':
-            # For non-IMC classes: do not use Resize; use RandomCrop directly
-            self.basic_transform_non_imc = transforms.Compose([
+            self.basic_transform = transforms.Compose([
                 GrayToRGB(),
                 transforms.RandomCrop(self.expected_size),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
             ])
-            self.augmentation_transform_non_imc = transforms.Compose([
+            self.augmentation_transform = transforms.Compose([
                 GrayToRGB(),
                 transforms.RandomCrop(self.expected_size),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomVerticalFlip(),
-                transforms.RandomChoice([
-                    transforms.RandomRotation(degrees=[0, 0]),
-                    transforms.RandomRotation(degrees=[90, 90]),
-                    transforms.RandomRotation(degrees=[180, 180]),
-                    transforms.RandomRotation(degrees=[270, 270])
-                ]),
-                transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-                transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.3),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ])
-            # For IMC class: directly remove Resize and use BottomCrop
-            self.basic_transform_imc = transforms.Compose([
-                GrayToRGB(),
-                BottomCrop(self.expected_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ])
-            self.augmentation_transform_imc = transforms.Compose([
-                GrayToRGB(),
-                BottomCrop(self.expected_size),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomVerticalFlip(),
                 transforms.RandomChoice([
@@ -152,17 +125,9 @@ class CustomXrayDataset(Dataset):
                                      std=[0.229, 0.224, 0.225])
             ])
         elif self.phase == 'validation':
-            # Validation phase: also remove Resize operation
-            self.single_crop_transform_non_imc = transforms.Compose([
+            self.single_crop_transform = transforms.Compose([
                 GrayToRGB(),
                 transforms.RandomCrop(self.expected_size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ])
-            self.single_crop_transform_imc = transforms.Compose([
-                GrayToRGB(),
-                BottomCrop(self.expected_size),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
@@ -175,7 +140,7 @@ class CustomXrayDataset(Dataset):
         """
         Return the image and its label based on the index.
         During training, decide whether to use data augmentation based on the marker;
-        during validation, directly use the single-crop preprocessing, returning a tensor image.
+        during validation, directly use the single-crop preprocessing, returning the image as a tensor.
         """
         img_path = self.images[idx]
         label = self.labels[idx]
@@ -186,20 +151,11 @@ class CustomXrayDataset(Dataset):
 
         if self.phase == 'train':
             if transform_type == 'original':
-                if label == self.label_map["IMC"]:
-                    image = self.basic_transform_imc(image)
-                else:
-                    image = self.basic_transform_non_imc(image)
+                image = self.basic_transform(image)
             elif transform_type == 'augmented':
-                if label == self.label_map["IMC"]:
-                    image = self.augmentation_transform_imc(image)
-                else:
-                    image = self.augmentation_transform_non_imc(image)
+                image = self.augmentation_transform(image)
         elif self.phase == 'validation':
-            if label == self.label_map["IMC"]:
-                image = self.single_crop_transform_imc(image)
-            else:
-                image = self.single_crop_transform_non_imc(image)
+            image = self.single_crop_transform(image)
         return image, label
 
 def create_data_loaders_ddp(data_dir, batch_size=32, num_workers=8):

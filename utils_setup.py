@@ -5,23 +5,21 @@ import numpy as np
 import torch
 import re
 import os
-from comet_ml import Experiment  # Import Experiment from Comet.ml
-
+import wandb  
 
 ## Logger ##
 ######################################################################################################
-def setup_logging(log_dir, rank, comet_api_key=None, comet_project_name=None, comet_workspace=None):
+def setup_logging(log_dir, rank, wandb_project=None, run_name=None):
     """
-    Set up logging. For the main process (rank=0), configure file logging and Comet.ml experiment.
+    Set up logging. For the main process (rank=0), configure file logging and initialize a wandb run.
 
     Parameters:
     - log_dir (str): Log directory.
     - rank (int): Process rank.
-    - comet_api_key (str, optional): API key for Comet.ml. If not provided, will attempt to read from environment variable 'COMET_API_KEY'.
-    - comet_project_name (str, optional): Project name on Comet.ml.
-    - comet_workspace (str, optional): Workspace name on Comet.ml.
+    - wandb_project (str, optional): Project name on Weights & Biases.
+    - run_name (str, optional): Run name on Weights & Biases.
     """
-    experiment = None
+    run = None
     if rank == 0:
         # Set up file logging
         log_file = os.path.join(log_dir, f'train_rank_{rank}.log')
@@ -34,16 +32,14 @@ def setup_logging(log_dir, rank, comet_api_key=None, comet_project_name=None, co
         )
         logging.info("Logging is set up.")
 
-        # Set up Comet.ml experiment
-        experiment = Experiment(
-            api_key=comet_api_key,  # Your Comet.ml API key
-            project_name=comet_project_name,  # Your project name
-            workspace=comet_workspace,  # Your workspace name
-            log_code=True,  # Whether to automatically log code
-            auto_output_logging="simple",  # Auto output logging level
+        # Initialize wandb run
+        run = wandb.init(
+            project=wandb_project,
+            name=run_name,
+            reinit=True  # Allow reinitialization if needed
         )
-        logging.info("Comet.ml experiment is initialized.")
-    return experiment
+        logging.info("Weights & Biases run is initialized.")
+    return run
 
 def log_metrics_to_file(epoch, train_loss, validation_loss, learning_rate, duration, rank):
     """
@@ -60,12 +56,12 @@ def log_metrics_to_file(epoch, train_loss, validation_loss, learning_rate, durat
     if rank == 0:
         logging.info(f"Epoch: {epoch}, Train Loss: {train_loss:.4f}, Validation Loss: {validation_loss:.4f}, LR: {learning_rate:.6f}, Duration: {duration:.2f}s")
 
-def log_metrics_to_comet(experiment, global_step, train_loss=None, validation_loss=None, learning_rate=None, duration=None, rank=0):
+def log_metrics_to_wandb(run, global_step, train_loss=None, validation_loss=None, learning_rate=None, duration=None, rank=0):
     """
-    Log training metrics to Comet.ml (main process only).
+    Log training metrics to Weights & Biases (main process only).
 
     Parameters:
-    - experiment (Experiment): Comet.ml Experiment object.
+    - run (Run): wandb Run object.
     - global_step (int): Global step.
     - train_loss (float, optional): Training loss.
     - validation_loss (float, optional): Validation loss.
@@ -73,7 +69,7 @@ def log_metrics_to_comet(experiment, global_step, train_loss=None, validation_lo
     - duration (float, optional): Duration of this epoch (seconds).
     - rank (int): Process rank.
     """
-    if rank == 0 and experiment is not None:
+    if rank == 0 and run is not None:
         metrics = {"global_step": global_step}
         if train_loss is not None:
             metrics["Loss/train"] = train_loss
@@ -84,40 +80,114 @@ def log_metrics_to_comet(experiment, global_step, train_loss=None, validation_lo
         if duration is not None:
             metrics["Duration (s)"] = duration
 
-        experiment.log_metrics(metrics, step=global_step)
+        run.log(metrics, step=global_step)
 
+######################################################################################################
 
+## Early Stop ##
+######################################################################################################
+class EarlyStopping:
+    """
+    Stop training early if the validation loss does not improve within a given patience.
+
+    Parameters:
+        patience (int): Maximum number of consecutive epochs with no improvement before stopping.
+        verbose (bool): If True, print messages when saving the model.
+        delta (float): Minimum improvement threshold. Only if the validation loss decreases by more than this value is it considered an improvement.
+        path (str): File path to save the best model.
+        trace_func (function): Function for printing log messages, default is print.
+    """
+    def __init__(self, patience=10, verbose=False, delta=0, path='checkpoint.pt', trace_func=print):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+        self.path = path
+        self.trace_func = trace_func
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            self.trace_func(f"EarlyStopping counter: {self.counter} out of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        """
+        Save the model parameters when the validation loss decreases.
+        """
+        if self.verbose:
+            self.trace_func(f"Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model ...")
+        torch.save(model.state_dict(), self.path)
+        self.val_loss_min = val_loss
 
 ######################################################################################################
 
 ## Save/Load Model ##
 ######################################################################################################
-def save_checkpoint(model, optimizer, epoch, best_val_loss, checkpoint_dir='checkpoints'):
-    # Ensure the checkpoint directory exists
+def save_checkpoint(model, optimizer, epoch, best_val_loss,
+                    checkpoint_dir='checkpoints',
+                    scheduler=None):
+    """
+    Save a checkpoint including model state, optimizer state, epoch, best_val_loss,
+    and (optionally) the scheduler state.
+    """
     os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(
+        checkpoint_dir,
+        f'best_model_epoch_{epoch}_val_loss_{best_val_loss:.4f}.pth'
+    )
+
+    # Package core information into the checkpoint
     checkpoint = {
-        'model_state_dict': model.state_dict(),  # Model weights
-        'optimizer_state_dict': optimizer.state_dict(),  # Optimizer state
-        'epoch': epoch,  # Current epoch
-        'best_val_loss': best_val_loss  # Best validation loss
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'best_val_loss': best_val_loss,
     }
-    checkpoint_path = os.path.join(checkpoint_dir, f'best_model_epoch_{epoch}_val_loss_{best_val_loss:.4f}.pth')
+
+    # If a scheduler is provided, save its state_dict
+    if scheduler is not None:
+        checkpoint['scheduler_state_dict'] = scheduler.state_dict()
+
     torch.save(checkpoint, checkpoint_path)
     print(f"Model checkpoint saved at epoch {epoch} with val loss: {best_val_loss:.4f}")
 
-def load_checkpoint(model, optimizer, checkpoint_path=''):
-    # Load a checkpoint if the path exists
+
+def load_checkpoint(model, optimizer, checkpoint_path='', scheduler=None):
+    """
+    Load a checkpoint and restore the model, optimizer, epoch, best_val_loss,
+    and (optionally) the scheduler state.
+    """
     if os.path.isfile(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
         epoch = checkpoint['epoch']
         best_val_loss = checkpoint['best_val_loss']
+
+        # If the checkpoint contains scheduler_state_dict and a scheduler is provided, restore it
+        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
         print(f"Loaded checkpoint from epoch {epoch} with val loss {best_val_loss:.4f}")
         return epoch, best_val_loss
     else:
         print(f"No checkpoint found at {checkpoint_path}")
-        return 0, float('inf')  # Return initial state if no checkpoint is found
+        return 0, float('inf')
 
 def get_latest_checkpoint(checkpoint_dir):
     # Get the latest checkpoint from the directory
@@ -185,7 +255,7 @@ def print_gpu_memory_usage():
 
 ######################################################################################################
 
-#Setting_seed
+## Setting Seed ##
 ######################################################################################################
 def set_seed(seed):
     """

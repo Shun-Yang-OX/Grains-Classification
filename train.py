@@ -1,6 +1,8 @@
 import os
+import glob
 import time
 import torch
+import wandb
 import torch.multiprocessing as mp
 
 from torch import GradScaler
@@ -10,14 +12,18 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import Model
 import dataset
 import Engine
-import utils_setup
-
-# Import Environment Variables
+import utils_setup  # Assuming this is the file containing helper functions such as setup_logging, save_checkpoint, load_checkpoint, etc.
 from dotenv import load_dotenv
-load_dotenv()  # Load environment variables from a .env file
 
 
-def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs, seed, comet_api_key, comet_project_name, comet_workspace):
+# Load environment variables from a .env file
+load_dotenv()
+
+source_dir = os.getenv("WORKSPACE")
+if source_dir is None:
+    raise ValueError("Please set the WORKSPACE environment variable.")
+
+def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs, seed, wandb_project, run_name):
     """
     Train the model using Distributed Data Parallel (DDP).
 
@@ -29,121 +35,111 @@ def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs,
         batch_size (int): Number of samples per batch.
         num_epochs (int): Total number of training epochs.
         seed (int): Base seed for reproducibility.
-        comet_api_key (str): API key for Comet.ml.
-        comet_project_name (str): Project name for Comet.ml.
-        comet_workspace (str): Workspace name for Comet.ml.
+        wandb_project (str): Project name for Weights & Biases.
+        run_name (str): Run name for Weights & Biases.
     """
-    # Set the random seed for reproducibility, adjusted by the process rank
+    # ------------------ 1) Set the random seed ------------------ #
     utils_setup.set_seed(seed + rank)
-    
-    # Initialize distributed training environment
+
+    # ------------------ 2) Initialize the distributed environment ------------------ #
     Engine.setup_ddp(rank, world_size)
-    device = torch.device(f'cuda:{rank}')  # Assign a specific GPU to this process
-    
-    # Create the result directory if it doesn't exist (only by the main process)
-    if not os.path.exists(Result_folder):
-        if rank == 0:
-            os.makedirs(Result_folder)
-            print(f"Created result directory at {Result_folder}")
-    
-    # Define the logging directory within the result folder
+    device = torch.device(f'cuda:{rank}')
+
+    # Only the main process creates the result directory
+    if rank == 0 and not os.path.exists(Result_folder):
+        os.makedirs(Result_folder)
+        print(f"Created result directory at {Result_folder}")
+
+    # Set up log directory & initialize wandb (only in main process)
     log_dir = os.path.join(Result_folder, 'logs')
-    
-    # Initialize logging and Comet.ml experiment (only for the main process)
-    experiment = utils_setup.setup_logging(
+    run = utils_setup.setup_logging(
         log_dir=log_dir,
         rank=rank,
-        comet_api_key=comet_api_key,
-        comet_project_name=comet_project_name,
-        comet_workspace=comet_workspace
+        wandb_project=wandb_project,
+        run_name=run_name
     )
-    
-    # Perform device and environment checks to ensure everything is set up correctly
+
+    # Check device, DDP usage, etc.
     utils_setup.check_device()
     utils_setup.check_multi_gpu(world_size)
     utils_setup.check_mixed_precision()
-    
-    # Create data loaders for training, validation, and testing using DDP
-    data_loader_train, data_loader_validation, data_test = dataset.create_data_loaders_ddp(data_dir, batch_size)
-    
-    # Build the ResNet152 model tailored for X-ray classification and move it to the designated device
-    model = Model.build_resnet152_for_xray(num_classes=2, freeze_backbone=True).to(device)
-    
-    # Wrap the model with DistributedDataParallel to handle gradient synchronization across processes
+
+    # ------------------ 3) Create data loaders (DDP) ------------------ #
+    data_loader_train, data_loader_validation = dataset.create_data_loaders_ddp(data_dir, batch_size)
+
+    # ------------------ 4) Build model & wrap with distributed parallel ------------------ #
+    model = Model.build_swin_transformer_model(num_classes=4, freeze_backbone=True).to(device)
     model = DDP(model, device_ids=[rank])
-    
-    # Verify that the model is correctly wrapped with DDP
     utils_setup.check_ddp_usage(model, rank)
-    
-    # Configure the optimizer, specifying whether to train only the classifier layers
+
+    # ------------------ 5) Configure optimizer & scheduler ------------------ #
     optimizer = Model.configure_optimizer(model, train_only_classifier=True)
-    
-    # Calculate total and warmup iterations for the learning rate scheduler
     total_iters = len(data_loader_train) * num_epochs
     warmup_iters = len(data_loader_train)
-    
-    # Initialize the learning rate scheduler
     scheduler = Model.initialize_scheduler(optimizer, warmup_iters, total_iters)
-    
-    # Initialize GradScaler for mixed precision training (Automatic Mixed Precision - AMP)
+
+    # ------------------ 6) Mixed precision training related ------------------ #
     scaler = GradScaler("cuda")
-    
-    # Define the checkpoint directory within the result folder
+
+    # ------------------ 7) Try loading the latest checkpoint ------------------ #
     checkpoint_dir = os.path.join(Result_folder, 'checkpoints')
-    if not os.path.exists(checkpoint_dir):
-        if rank == 0:
-            os.makedirs(checkpoint_dir)
-            print(f"Created checkpoint directory at {checkpoint_dir}")
-    
-    # Attempt to load the latest checkpoint to resume training
+    if rank == 0 and not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+        print(f"Created checkpoint directory at {checkpoint_dir}")
+
     checkpoint_path = utils_setup.get_latest_checkpoint(checkpoint_dir)
     if checkpoint_path is not None:
-        start_epoch, best_val_loss = utils_setup.load_checkpoint(model, optimizer, checkpoint_path)
+        start_epoch, best_val_loss = utils_setup.load_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            checkpoint_path=checkpoint_path,
+            scheduler=scheduler  # Let scheduler resume synchronously
+        )
         if rank == 0:
             print(f"Checkpoint found. Resuming training from epoch {start_epoch}.")
     else:
-        # If no checkpoint is found, start training from scratch
         start_epoch = 0
         best_val_loss = float('inf')
         if rank == 0:
             print("No checkpoint found. Starting training from scratch.")
-    
-    global_step = 0  # Initialize the global step counter
+
+    # ------------------ 8) Set wandb watch in the main process ------------------ #
+    if rank == 0 and run is not None:
+        wandb.watch(model.module if hasattr(model, "module") else model, log="all", log_freq=100)
+
+    global_step = 0
+
+    # ------------------ 9) Training loop ------------------ #
     for epoch in range(start_epoch, num_epochs):
-        start_time = time.time()  # Record the start time of the epoch
-        
-        # Periodically print GPU memory usage for monitoring (every 10 epochs)
+        start_time = time.time()
+
+        # Print GPU memory usage every 10 epochs
         if epoch % 10 == 0:
             utils_setup.print_gpu_memory_usage()
-        
-        # Train and validate the model for one epoch
+
+        # Training & validation for a single epoch
         train_loss, val_loss, global_step = Engine.train_and_validate_one_epoch_ddp(
             model=model,
             data_loader_train=data_loader_train,
             data_loader_val=data_loader_validation,
-            train_sampler=data_loader_train.sampler,  # Ensure proper shuffling for DDP
+            train_sampler=data_loader_train.sampler,  # Ensure random sampling for DDP
             optimizer=optimizer,
             scaler=scaler,
             device=device,
             epoch=epoch,
             rank=rank,
             scheduler=scheduler,
-            experiment=experiment,  # Pass the Comet.ml experiment object for logging
+            experiment=run,
             global_step=global_step
         )
-        
-        # Retrieve the current learning rate from the optimizer
+
         learning_rate = optimizer.param_groups[0]['lr']
-        
-        # Calculate the duration of the epoch
         epoch_duration = time.time() - start_time
-        
-        # Log the training and validation metrics to the log file
+
+        # Logging (file + wandb)
         utils_setup.log_metrics_to_file(epoch, train_loss, val_loss, learning_rate, epoch_duration, rank)
-        
-        # Log the metrics to Comet.ml for experiment tracking and visualization
-        utils_setup.log_metrics_to_comet(
-            experiment,
+        utils_setup.log_metrics_to_wandb(
+            run,
             epoch,
             train_loss=train_loss,
             validation_loss=val_loss,
@@ -151,68 +147,77 @@ def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs,
             duration=epoch_duration,
             rank=rank
         )
-        
-        # Check if the current validation loss is the best so far
+
+        # ------------------ 10) Checkpoint saving logic ------------------ #
         if val_loss < best_val_loss:
-            best_val_loss = val_loss  # Update the best validation loss
+            best_val_loss = val_loss
             if rank == 0:
-                # Save the model checkpoint as it has achieved a new best validation loss
-                utils_setup.save_checkpoint(model, optimizer, epoch, best_val_loss, checkpoint_dir)
+                utils_setup.save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    best_val_loss=best_val_loss,
+                    checkpoint_dir=checkpoint_dir,
+                    scheduler=scheduler  # Save scheduler state
+                )
         elif epoch % 10 == 0 and rank == 0:
-            # Additionally save checkpoints every 10 epochs regardless of validation loss
-            utils_setup.save_checkpoint(model, optimizer, epoch, best_val_loss, checkpoint_dir)
-    
-    # Clean up the distributed training environment after all epochs are completed
+            # Save checkpoint every 10 epochs
+            utils_setup.save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                best_val_loss=best_val_loss,
+                checkpoint_dir=checkpoint_dir,
+                scheduler=scheduler
+            )
+
+    # ------------------ 11) Training completion handling ------------------ #
     Engine.cleanup_ddp()
-    
-    # End the Comet.ml experiment to finalize logging and metrics (only by the main process)
-    if rank == 0 and experiment is not None:
-        experiment.end()
 
+    # Only the main process handles wandb artifacts & run finish
+    if rank == 0 and run is not None:
+        best_checkpoint_path = utils_setup.get_latest_checkpoint(os.path.join(Result_folder, 'checkpoints'))
+        if best_checkpoint_path is not None:
+            artifact = wandb.Artifact("best_model", type="model", description="Best model checkpoint")
+            artifact.add_file(best_checkpoint_path)
+            run.log_artifact(artifact)
+            print("Best model artifact uploaded.")
 
-def main_ddp(world_size, data_dir, Result_folder, batch_size, num_epochs, seed, comet_api_key, comet_project_name, comet_workspace):
+            # Upload all .py files
+            code_artifact = wandb.Artifact("source_code", type="code", description="All Python source files from the project")
+            for py_file in glob.glob(os.path.join(source_dir, "**", "*.py"), recursive=True):
+                code_artifact.add_file(py_file)
+            run.log_artifact(code_artifact)
+            print("Source code artifact uploaded.")
+
+        run.finish()
+
+def main_ddp(world_size, data_dir, Result_folder, batch_size, num_epochs, seed, wandb_project, RUNNAME=None):
     """
     Initialize and start the Distributed Data Parallel (DDP) training process.
-
-    Args:
-        world_size (int): Total number of processes (typically equal to the number of GPUs).
-        data_dir (str): Directory containing the dataset.
-        Result_folder (str): Directory to save results and checkpoints.
-        batch_size (int): Number of samples per batch.
-        num_epochs (int): Total number of training epochs.
-        seed (int): Base seed for reproducibility.
-        comet_api_key (str): API key for Comet.ml.
-        comet_project_name (str): Project name for Comet.ml.
-        comet_workspace (str): Workspace name for Comet.ml.
     """
-    # Spawn multiple processes for distributed training, each running the train_ddp function
     mp.spawn(
         train_ddp,
-        args=(world_size, data_dir, Result_folder, batch_size, num_epochs, seed, comet_api_key, comet_project_name, comet_workspace),
-        nprocs=world_size,  # Number of processes to spawn (typically equal to the number of GPUs)
-        join=True  # Wait for all processes to finish
+        args=(world_size, data_dir, Result_folder, batch_size, num_epochs, seed, wandb_project, RUNNAME),
+        nprocs=world_size,
+        join=True
     )
 
-
 if __name__ == "__main__":
-    # Define the directory paths for data and results
-    DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/Data_input'
-    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result_test_2025.01/ResNet_frozen'
-    
-    # Set training parameters
-    world_size = 4  # Number of GPUs to use (and hence the number of processes)
-    batch_size = 4  # Number of samples per batch per GPU
-    num_epochs = 20  # Total number of training epochs
-    seed = 10086  # Base seed for reproducibility
-    
-    # Read Comet.ml configuration from environment variables
-    COMET_API_KEY = os.getenv("COMET_API_KEY")
-    COMET_PROJECT_NAME = os.getenv("COMET_PROJECT_NAME")
-    COMET_WORKSPACE = os.getenv("COMET_WORKSPACE")
-    
-    # Ensure that all necessary Comet.ml environment variables are set
-    if COMET_API_KEY is None or COMET_PROJECT_NAME is None or COMET_WORKSPACE is None:
-        raise ValueError("Please set the COMET_API_KEY, COMET_PROJECT_NAME, and COMET_WORKSPACE environment variables.")
-    
-    # Start the DDP training process
-    main_ddp(world_size, DATA_DIR, RESULT_FOLDER, batch_size, num_epochs, seed, COMET_API_KEY, COMET_PROJECT_NAME, COMET_WORKSPACE)
+    # ------------------ 12) Read basic configuration ------------------ #
+    DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/Data_input_v4'
+    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result_2025.2.18/ST_4_class_frozen_V3'
+
+    world_size = 4
+    batch_size = 4
+    num_epochs = 35
+    seed = 10086
+
+    WANDB_PROJECT = os.getenv("WANDB_PROJECT")
+    RUNNAME = os.getenv("RUNMANE")  # Note: variable spelling
+
+    if WANDB_PROJECT is None:
+        raise ValueError("Please set the WANDB_PROJECT environment variable.")
+
+    # ------------------ 13) Start DDP training ------------------ #
+    main_ddp(world_size, DATA_DIR, RESULT_FOLDER, batch_size, num_epochs, seed, WANDB_PROJECT, RUNNAME)

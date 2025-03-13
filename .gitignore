@@ -9,3 +9,5 @@
 /.env
 /Result_test_2025.01/
 /test.py
+/Result*
+/wandb

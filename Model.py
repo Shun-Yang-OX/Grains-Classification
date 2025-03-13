@@ -6,7 +6,6 @@ from torch.optim import SGD
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
-
 import torch.nn as nn
 from torchvision import models
 
@@ -38,11 +37,58 @@ def build_resnet152_for_xray(num_classes, pretrained=True, freeze_backbone=False
 
     return model
 
+def build_swin_transformer_v2_model(model_name='swinv2_large_window12_192.ms_in22k',
+                                    num_classes=4,
+                                    img_size=1056,
+                                    pretrained=True,
+                                    in_chans=3,
+                                    freeze_backbone=False):
+    """
+    Build and return a Swin Transformer V2 model for classification tasks.
 
+    Parameters:
+        model_name (str): The name of the Swin Transformer V2 model in the timm library.
+                          Example: 'swinv2_large_window12to24_192to384_22kft1k'
+        num_classes (int): Number of output classes. For binary classification, set to 2.
+        img_size (int or tuple): Input image size. If an int, the image will be resized to (img_size, img_size).
+        pretrained (bool): Whether to load pretrained weights.
+        in_chans (int): Number of input channels, default is 3 (RGB images).
+        freeze_backbone (bool): Whether to freeze the backbone, training only the classification head.
+
+    Returns:
+        model (torch.nn.Module): The constructed Swin Transformer V2 model.
+    """
+    try:
+        model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes,
+                                  img_size=img_size, in_chans=in_chans)
+        print(f"Successfully loaded model: {model_name}, pretrained: {pretrained}")
+    except Exception as e:
+        raise ValueError(f"Unable to create model '{model_name}'. Please check if the model name is correct and if the current timm version supports this model. Error details: {e}")
+
+    if freeze_backbone:
+        # Freeze all parameters
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # Usually the classification head of a Swin Transformer V2 is model.head
+        if hasattr(model, 'head'):
+            for param in model.head.parameters():
+                param.requires_grad = True
+            print("Backbone parameters have been frozen. Only the classification head will be trained.")
+        else:
+            # If there is no 'head' attribute, print all parameter names for locating the classification head
+            print("No 'head' attribute detected in the model. Here are all parameter names:")
+            for name, param in model.named_parameters():
+                print(name)
+            raise ValueError("Please modify the code based on the parameter names printed above to ensure the classification head parameters are unfrozen.")
+    else:
+        print("Training the entire model, including the backbone and classification head.")
+    
+    return model
 
 def build_swin_transformer_model(model_name='swin_large_patch4_window12_384_in22k',
-                                 num_classes=2,
-                                 img_size=1200,
+                                 num_classes=4,
+                                 img_size=1056,
                                  pretrained=True,
                                  in_chans=3,
                                  freeze_backbone=False):
@@ -91,9 +137,9 @@ def build_swin_transformer_model(model_name='swin_large_patch4_window12_384_in22
     return model
 
 
-def configure_optimizer(model, learning_rate=3e-5, momentum=0.9, weight_decay=1e-4, train_only_classifier=False):
+def configure_optimizer(model, learning_rate=2e-5, momentum=0.9, weight_decay=1e-4, train_only_classifier=False):
     """
-    Configure the SGD optimizer.
+    Configure the optimizer.
 
     Args:
         model (torch.nn.Module): The model to be trained.
@@ -118,7 +164,7 @@ def configure_optimizer(model, learning_rate=3e-5, momentum=0.9, weight_decay=1e
         trainable_params = model.parameters()
         print("Optimizer is configured to train all parameters of the model.")
     
-    # Define the SGD optimizer
+    # Define the AdamW optimizer
     optimizer = AdamW(
         trainable_params,
         lr=learning_rate,
