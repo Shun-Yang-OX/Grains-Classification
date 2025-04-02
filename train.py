@@ -11,6 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # Import custom modules
 import Model
 import dataset
+import dataset_3class
 import Engine
 import utils_setup  # Assuming this is the file containing helper functions such as setup_logging, save_checkpoint, load_checkpoint, etc.
 from dotenv import load_dotenv
@@ -65,10 +66,10 @@ def train_ddp(rank, world_size, data_dir, Result_folder, batch_size, num_epochs,
     utils_setup.check_mixed_precision()
 
     # ------------------ 3) Create data loaders (DDP) ------------------ #
-    data_loader_train, data_loader_validation = dataset.create_data_loaders_ddp(data_dir, batch_size)
+    data_loader_train, data_loader_validation = dataset_3class.create_data_loaders_ddp(data_dir, batch_size)
 
     # ------------------ 4) Build model & wrap with distributed parallel ------------------ #
-    model = Model.build_swin_transformer_model(num_classes=4, freeze_backbone=True).to(device)
+    model = Model.build_resnet152_for_xray(num_classes=3, freeze_backbone=True).to(device)
     model = DDP(model, device_ids=[rank])
     utils_setup.check_ddp_usage(model, rank)
 
@@ -205,11 +206,11 @@ def main_ddp(world_size, data_dir, Result_folder, batch_size, num_epochs, seed, 
 
 if __name__ == "__main__":
     # ------------------ 12) Read basic configuration ------------------ #
-    DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/Data_input_v4'
-    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result_2025.2.18/ST_4_class_frozen_V3'
+    DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/dataset_v1/Data_input'
+    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result_2025.2.22/ResNet_3_class_frozen'
 
     world_size = 4
-    batch_size = 4
+    batch_size = 32
     num_epochs = 35
     seed = 10086
 

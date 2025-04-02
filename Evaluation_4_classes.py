@@ -1,20 +1,20 @@
+# Evaluation_4_classes.py
+
 import os
 import torch
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.metrics import confusion_matrix, accuracy_score, balanced_accuracy_score
 import seaborn as sns
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-
 import cv2
-from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from pytorch_grad_cam.utils.image import show_cam_on_image
 
+# 导入 CAM 相关函数
+import cam_utils
 import Model  
 import utils_setup  
 import utils_analysis
@@ -46,77 +46,40 @@ class CustomImageDataset(Dataset):
             img = Image.open(f)
             return img.convert('RGB')
 
-def build_model_and_cam(model_type, model_weights_path, num_classes):
+def run_evaluation(data_dir, result_folder, model_weights_path, num_classes, batch_size, seed, model_type, output_cam=False, cam_method='gradcam'):
+    """
+    运行评估流程：
+      - 调用 Model.py 构建模型并加载权重
+      - 根据模型构建 CAM 对象（如果 output_cam 为 True 则生成 CAM 热力图）
+      - 对 test 数据集进行评估，并保存各子文件夹下的分类结果、混淆矩阵、概率曲线等
+    """
+    utils_setup.set_seed(seed)
+    
+    # 构建模型（调用 Model.py 中的 build 函数）
     if model_type.lower() == "resnet":
-        model = Model.build_resnet152_for_xray(num_classes=num_classes, pretrained=True)
+        model = Model.build_resnet152_for_xray(num_classes=num_classes, pretrained=True, freeze_backbone=True)
     elif model_type.lower() == "swin":
         model = Model.build_swin_transformer_model(num_classes=num_classes)
     elif model_type.lower() == "swin_v2":
         model = Model.build_swin_transformer_v2_model(num_classes=num_classes)
     else:
-        raise ValueError(f"model_type='{model_type}' not supported. Please use 'resnet' or 'swin'.")
+        raise ValueError(f"不支持的 model_type: {model_type}")
     
+    # 加载权重
     checkpoint = torch.load(model_weights_path, map_location=device)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
     new_state_dict = {key.replace('module.', ''): state_dict[key] for key in state_dict}
     model.load_state_dict(new_state_dict)
-    model.eval().to(device)
+    model.to(device)
+    model.eval()
     
-    if model_type.lower() == "resnet":
-        target_layers = [model.layer4[-1].conv3]
-        cam = GradCAM(model=model, target_layers=target_layers)
-    elif model_type.lower() in ["swin", "swin_v2"]:
-        target_layers = [model.layers[-1].blocks[-1].norm2]
-        def reshape_transform(tensor):
-            import math
-            B, N, C = tensor.shape
-            h = w = int(math.sqrt(N))
-            if h * w != N:
-                raise ValueError(f"N={N} is not a perfect square, cannot reshape to [H,W].")
-            result = tensor.reshape(B, h, w, C).permute(0, 3, 1, 2)
-            return result
-        cam = GradCAM(model=model, target_layers=target_layers, reshape_transform=reshape_transform)
+    # 若需要 CAM 可视化，则利用 cam_utils 构建 CAM 对象
+    if output_cam:
+        cam = cam_utils.build_cam(model, model_type, cam_method=cam_method)
     else:
-        raise ValueError(f"model_type='{model_type}' not supported. Please use 'resnet' or 'swin'.")
-    return model, cam
-
-def generate_gradcam_heatmaps(images, predicted, paths, experiment_result_folder, cam, target_size=(1056, 1056)):
-    """
-    Generate and save Grad-CAM heatmaps.
+        cam = None
     
-    Parameters:
-        images: The image tensor input to the model (already moved to device).
-        predicted: The predicted classes from the model (tensor).
-        paths: List of file paths corresponding to the images.
-        experiment_result_folder: Folder path to save the results.
-        cam: GradCAM object.
-        target_size: The size of the image when generating the heatmap (default: 1056x1056).
-    """
-    # Build targets for each sample
-    targets = [ClassifierOutputTarget(int(pred.cpu().numpy())) for pred in predicted]
-    # Compute grad-cam
-    grayscale_cams = cam(input_tensor=images, targets=targets)
-    # For each image in the batch, generate and save the heatmap
-    for i, file_path in enumerate(paths):
-        grayscale_cam = grayscale_cams[i]
-        pil_img = Image.open(file_path).convert('RGB')
-        pil_img = pil_img.resize(target_size)
-        rgb_img = np.array(pil_img, dtype=np.float32) / 255.0
-        cam_image = show_cam_on_image(rgb_img, grayscale_cam, use_rgb=True)
-        cam_image_bgr = cv2.cvtColor(cam_image, cv2.COLOR_RGB2BGR)
-        base_name = os.path.basename(file_path)
-        fname_no_ext, ext = os.path.splitext(base_name)
-        save_path = os.path.join(experiment_result_folder, f"{fname_no_ext}_gradcam{ext}")
-        cv2.imwrite(save_path, cam_image_bgr)
-
-def run_evaluation(data_dir, result_folder, model_weights_path, num_classes, batch_size, seed, model_type, output_gradcam=False):
-    """
-    Run the evaluation process on the test set and optionally output Grad-CAM heatmaps based on the value of output_gradcam.
-    """
-    utils_setup.set_seed(seed)
-    model, cam = build_model_and_cam(model_type, model_weights_path, num_classes)
-    
-    # Modify the preprocessing: directly CenterCrop to 1056x1056
+    # 定义测试预处理：CenterCrop 到 1056x1056
     data_transforms = transforms.Compose([
         transforms.CenterCrop(1056),
         transforms.ToTensor(),
@@ -125,25 +88,18 @@ def run_evaluation(data_dir, result_folder, model_weights_path, num_classes, bat
     ])
     
     test_dir = os.path.join(data_dir, 'test')
-    # Added "IMC" class in the category list
     categories = ['columnar', 'equiax', 'background', 'IMC']
-    class_to_label = {
-        "equiax": 0, 
-        "columnar": 1, 
-        "background": 2,
-        "IMC": 3
-    }
+    class_to_label = {"equiax": 0, "columnar": 1, "background": 2, "IMC": 3}
     overall_y_true = []
     overall_y_pred = []
     
     for category in categories:
         category_path = os.path.join(test_dir, category)
         if category not in class_to_label:
-            print(f"Category {category} not found in class_to_label dictionary. Skipping...")
+            print(f"类别 {category} 不在 label 字典中，跳过...")
             continue
         label = class_to_label[category]
-        subfolders = [name for name in os.listdir(category_path)
-                      if os.path.isdir(os.path.join(category_path, name))]
+        subfolders = [name for name in os.listdir(category_path) if os.path.isdir(os.path.join(category_path, name))]
         
         for subfolder in subfolders:
             subfolder_path = os.path.join(category_path, subfolder)
@@ -157,21 +113,20 @@ def run_evaluation(data_dir, result_folder, model_weights_path, num_classes, bat
                         image_paths.append(os.path.join(root, file))
             
             if not image_paths:
-                print(f"No images found in {subfolder_path}. Skipping...")
+                print(f"{subfolder_path} 中未找到图像，跳过...")
                 continue
             
             image_paths.sort()
-            labels = [label] * len(image_paths)
-            test_dataset = CustomImageDataset(image_paths, labels, transform=data_transforms)
-            data_loader_test = DataLoader(test_dataset, batch_size=batch_size,
-                                          shuffle=False, num_workers=4)
+            labels_list = [label] * len(image_paths)
+            test_dataset = CustomImageDataset(image_paths, labels_list, transform=data_transforms)
+            data_loader_test = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
             
             y_true, y_pred = [], []
             image_results = []
             image_probabilities_class0 = []
             image_probabilities_class1 = []
             image_probabilities_class2 = []
-            image_probabilities_class3 = []  # Added
+            image_probabilities_class3 = []
             
             for images, labels_batch, paths_batch in tqdm(data_loader_test, desc='Evaluating'):
                 images = images.to(device)
@@ -179,32 +134,31 @@ def run_evaluation(data_dir, result_folder, model_weights_path, num_classes, bat
                 probabilities = torch.nn.functional.softmax(outputs, dim=1)
                 predicted = torch.argmax(probabilities, dim=1)
                 
-                # Generate Grad-CAM heatmaps based on the flag
-                if output_gradcam:
-                    generate_gradcam_heatmaps(images, predicted, paths_batch, experiment_result_folder, cam, target_size=(1056, 1056))
+                # 若开启 CAM 输出，则生成热力图
+                if output_cam and cam is not None:
+                    cam_utils.generate_cam_heatmaps(images, predicted, paths_batch, experiment_result_folder, cam, target_size=(1056, 1056))
                 
                 y_true.extend(labels_batch.cpu().numpy())
                 y_pred.extend(predicted.cpu().numpy())
                 
                 for i in range(len(labels_batch)):
-                    prob_class_0 = probabilities[i, 0].item()
-                    prob_class_1 = probabilities[i, 1].item()
-                    prob_class_2 = probabilities[i, 2].item()
-                    prob_class_3 = probabilities[i, 3].item()  # Added
-                    
+                    prob0 = probabilities[i, 0].item()
+                    prob1 = probabilities[i, 1].item()
+                    prob2 = probabilities[i, 2].item()
+                    prob3 = probabilities[i, 3].item()
                     image_results.append({
                         'Filename': paths_batch[i],
                         'True_Label': labels_batch[i].item(),
                         'Predicted_Label': predicted[i].item(),
-                        'Prob_Class_0': prob_class_0,
-                        'Prob_Class_1': prob_class_1,
-                        'Prob_Class_2': prob_class_2,
-                        'Prob_Class_3': prob_class_3  # Added
+                        'Prob_Class_0': prob0,
+                        'Prob_Class_1': prob1,
+                        'Prob_Class_2': prob2,
+                        'Prob_Class_3': prob3
                     })
-                    image_probabilities_class0.append(prob_class_0)
-                    image_probabilities_class1.append(prob_class_1)
-                    image_probabilities_class2.append(prob_class_2)
-                    image_probabilities_class3.append(prob_class_3)  # Added
+                    image_probabilities_class0.append(prob0)
+                    image_probabilities_class1.append(prob1)
+                    image_probabilities_class2.append(prob2)
+                    image_probabilities_class3.append(prob3)
             
             overall_y_true.extend(y_true)
             overall_y_pred.extend(y_pred)
@@ -212,126 +166,87 @@ def run_evaluation(data_dir, result_folder, model_weights_path, num_classes, bat
             subfolder_results_df = pd.DataFrame(image_results)
             subfolder_csv_path = os.path.join(experiment_result_folder, "image_results.csv")
             subfolder_results_df.to_csv(subfolder_csv_path, index=False)
-            print(f"Classification results saved to {subfolder_csv_path}")
+            print(f"分类结果已保存至 {subfolder_csv_path}")
             
             conf_matrix = confusion_matrix(y_true, y_pred, labels=[0, 1, 2, 3])
             plt.figure(figsize=(8, 6))
             sns.heatmap(conf_matrix, annot=True, fmt="d", cmap="Blues",
                         xticklabels=['Equiaxed', 'Columnar', 'Background', 'IMC'],
                         yticklabels=['Equiaxed', 'Columnar', 'Background', 'IMC'])
-            plt.title('Confusion Matrix')
-            plt.xlabel('Predicted')
-            plt.ylabel('True')
+            plt.title('混淆矩阵')
+            plt.xlabel('预测')
+            plt.ylabel('真实')
             plt.tight_layout()
             conf_matrix_path = os.path.join(experiment_result_folder, "confusion_matrix.png")
             plt.savefig(conf_matrix_path)
             plt.close()
-            print(f"Confusion matrix saved to {conf_matrix_path}")
-            
-            def set_y_axis(prob_array):
-                p_min = min(prob_array)
-                p_max = max(prob_array)
-                if p_min == p_max:
-                    return p_min - 0.01, p_max + 0.01
-                margin = 0.05 * (p_max - p_min)
-                lower = p_min - margin
-                upper = p_max + margin
-                return max(0, lower), min(1, upper)
+            print(f"混淆矩阵保存至 {conf_matrix_path}")
             
             x_indices = range(len(image_probabilities_class0))
-            all_probabilities = (image_probabilities_class0 + image_probabilities_class1 +
-                                 image_probabilities_class2 + image_probabilities_class3)
-            ymin, ymax = set_y_axis(all_probabilities)
+            all_probs = (image_probabilities_class0 + image_probabilities_class1 +
+                         image_probabilities_class2 + image_probabilities_class3)
+            ymin = min(all_probs) - 0.01
+            ymax = max(all_probs) + 0.01
             plt.figure(figsize=(12, 6))
-            
-            plt.plot(x_indices, image_probabilities_class0, marker='o', linestyle='-', color='blue', label='Class 0')
-            plt.plot(x_indices, image_probabilities_class1, marker='^', linestyle='-', color='red', label='Class 1')
-            plt.plot(x_indices, image_probabilities_class2, marker='s', linestyle='-', color='green', label='Class 2')
-            plt.plot(x_indices, image_probabilities_class3, marker='d', linestyle='-', color='orange', label='IMC')
+            plt.plot(x_indices, image_probabilities_class0, marker='o', label='Class 0')
+            plt.plot(x_indices, image_probabilities_class1, marker='^', label='Class 1')
+            plt.plot(x_indices, image_probabilities_class2, marker='s', label='Class 2')
+            plt.plot(x_indices, image_probabilities_class3, marker='d', label='IMC')
             plt.ylim(ymin, ymax)
-            plt.xlabel('Image Index', fontsize=14)
-            plt.ylabel('Probability', fontsize=14)
-            plt.title('Probability per Image for Each Class', fontsize=16)
+            plt.xlabel('图像索引')
+            plt.ylabel('概率')
+            plt.title('各图像类别概率')
             plt.legend()
             plt.tight_layout()
-            plt.savefig(os.path.join(experiment_result_folder, "Probability_per_video.png"))
+            prob_plot_path = os.path.join(experiment_result_folder, "Probability_per_video.png")
+            plt.savefig(prob_plot_path)
             plt.close()
-            print(f"Probability curves saved to {experiment_result_folder}")
+            print(f"概率曲线图保存至 {prob_plot_path}")
     
     overall_accuracy = accuracy_score(overall_y_true, overall_y_pred)
-    print(f"Overall model accuracy: {overall_accuracy * 100:.2f}%")
+    print(f"总体准确率: {overall_accuracy * 100:.2f}%")
     
-    overall_results_path = os.path.join(result_folder, "overall_results.csv")
     overall_results_df = pd.DataFrame({'Overall_Accuracy': [overall_accuracy]})
+    overall_results_path = os.path.join(result_folder, "overall_results.csv")
     overall_results_df.to_csv(overall_results_path, index=False)
-    print(f"Overall accuracy saved to {overall_results_path}")
+    print(f"总体准确率结果保存至 {overall_results_path}")
     
     overall_conf_matrix = confusion_matrix(overall_y_true, overall_y_pred, labels=[0, 1, 2, 3])
     plt.figure(figsize=(8, 6))
     sns.heatmap(overall_conf_matrix, annot=True, fmt="d", cmap="Greens",
                 xticklabels=['Equiaxed', 'Columnar', 'Background', 'IMC'],
                 yticklabels=['Equiaxed', 'Columnar', 'Background', 'IMC'])
-    plt.title('Overall Confusion Matrix')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
+    plt.title('总体混淆矩阵')
+    plt.xlabel('预测')
+    plt.ylabel('真实')
     plt.tight_layout()
     overall_conf_matrix_path = os.path.join(result_folder, "overall_confusion_matrix.png")
     plt.savefig(overall_conf_matrix_path)
     plt.close()
-    print(f"Overall confusion matrix saved to {overall_conf_matrix_path}")
+    print(f"总体混淆矩阵保存至 {overall_conf_matrix_path}")
+    
+    # 调用原有功能（动画生成、每视频准确率统计、整体平衡准确率计算）
+    utils_analysis.generate_animations(result_folder, data_dir, with_heatmap=True)
+    utils_analysis.calculate_accuracy_for_folders(result_folder)
+    utils_analysis.compute_overall_balanced_accuracy(result_folder)
+    
+    return overall_accuracy
 
-def main(
-        DATA_DIR, 
-        RESULT_FOLDER, 
-        MODEL_WEIGHTS_PATH, 
-        num_classes, 
-        batch_size, 
-        seed, 
-        model_type, 
-        get_evaluation=False,
-        output_gradcam=False,
-        animation=False, 
-        get_accuracy_per_video=False, 
-        get_overall_balanced_accuracy=False,
-        with_heatmap=True
-        ):
-    # Call the evaluation process
-    if get_evaluation:
-        run_evaluation(DATA_DIR, RESULT_FOLDER, MODEL_WEIGHTS_PATH, num_classes, batch_size, seed, model_type, output_gradcam)
-    
-    if animation:
-        utils_analysis.generate_animations(RESULT_FOLDER, DATA_DIR, with_heatmap)
-    
-    if get_accuracy_per_video:
-        utils_analysis.calculate_accuracy_for_folders(RESULT_FOLDER)
-    
-    if get_overall_balanced_accuracy:
-        utils_analysis.compute_overall_balanced_accuracy(RESULT_FOLDER)
-
-if __name__ == "__main__":
-    # Parameter settings
+def main():
     DATA_DIR = r'/home/shun/Project/Grains-Classification/Dataset/Test_demo'
-    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result_2025.2.18/ST_4_class_frozen_V3/evaluation3'
-    MODEL_WEIGHTS_PATH = r'/home/shun/Project/Grains-Classification/Result_2025.2.18/ST_4_class_frozen_V3/checkpoints/best_model_epoch_20_val_loss_0.2420.pth'
+    RESULT_FOLDER = r'/home/shun/Project/Grains-Classification/Result_CAM/evaluation'
+    MODEL_WEIGHTS_PATH = r'/home/shun/Project/Grains-Classification/Result_CAM/checkpoints/best_model_epoch_20_val_loss_0.2420.pth'
     num_classes = 4
     batch_size = 1
     seed = 10086
-    model_type = "swin"  # Options: "resnet" or "swin"
+    model_type = "swin"  # 或者 'resnet'
     
-    # Run evaluation
-    get_evaluation = False
-    # Whether to generate Grad-CAM heatmaps, True to generate, False to skip
-    output_gradcam = False
+    get_evaluation = True
+    output_cam = True         # 是否生成 CAM 热力图
+    cam_method = 'gradcam++'    # 可选 'gradcam', 'gradcam++', 'scorecam', 'original_cam'
     
-    # Animation
-    animation = True
-    with_heatmap = True
-    
-    # Accuracy per video
-    get_accuracy_per_video = False
-    
-    # Overall balanced accuracy
-    get_overall_balanced_accuracy = False
-    
-    main(DATA_DIR, RESULT_FOLDER, MODEL_WEIGHTS_PATH, num_classes, batch_size, seed, model_type, 
-         get_evaluation, output_gradcam, animation, get_accuracy_per_video, get_overall_balanced_accuracy, with_heatmap)
+    if get_evaluation:
+        run_evaluation(DATA_DIR, RESULT_FOLDER, MODEL_WEIGHTS_PATH, num_classes, batch_size, seed, model_type, output_cam, cam_method)
+
+if __name__ == "__main__":
+    main()

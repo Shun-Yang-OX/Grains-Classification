@@ -35,7 +35,7 @@ class CustomXrayDataset(Dataset):
         Args:
             data_dir (str): Root directory containing subfolders for each class.
             phase (str): 'train' or 'validation'.
-            expected_size (tuple): Expected output size, e.g., (1056, 1056).
+            expected_size (tuple): Expected output size of augmentation, e.g., (1056, 1056).
         """
         self.data_dir = data_dir
         self.phase = phase.lower()
